@@ -1,5 +1,13 @@
+//  HybridPM for the Acer Nitro ANV15-52 (i9-13900H) - ATTRIBUTION NOTICE: this file is a MODIFIED copy of XE-PM,
+//  src/NootedGreen/kern_xepm.cpp in https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe at commit
+//  99631db20ad841bb5d5f3934e4ffa4dc09f92dee (NootedGreen fork by JulioNectar; NootedGreen by StezzaPilot), licensed
+//  under the Thou Shalt Not Profit License 1.0 (LICENSE-TSNPL-1.0.txt beside this file); this file is under the same
+//  license. Changes: taken out of NootedGreen into a standalone
+//  Lilu plugin; boot-args and sysctls renamed (-hpm, hpmepp, hpmcst, hpmd3, hpmpl1; debug.hybridpm); the D3hot step is
+//  opt-in (hpmd3=1) instead of always on; log prefix HybridPM. The logic of the six steps is unchanged.
+//
 //  XE-PM: CPU performance and idle power profile for hybrid Alder Lake / Raptor Lake (and Tiger Lake) under XCPM.
-//  Opt-in with -ngreenpm. Everything is applied 20 s after the patcher loads (system up), re-checked at 60 s.
+//  Opt-in with -hpm (or hpm=W: the profile plus PL1 = W watts). Everything is applied 20 s after the patcher loads (system up), re-checked at 60 s.
 //
 //  1. HWP units (hybrid P-cores). XCPM writes IA32_HWP_REQUEST (0x774) max/desired in 100 MHz ratio units (max = the
 //     TURBO_RATIO_LIMIT value, 50 on an i7-1360P). On hybrid P-cores one HWP performance unit is ~78.7 MHz (Linux
@@ -9,14 +17,14 @@
 //     cores whose highest perf exceeds the requested max (max -> highest, desired -> desired * highest / max). The
 //     route is installed only after the prologue and the write site match byte for byte.
 //  2. EPP. XCPM's frequency vector asks EPP 0x80. On ADL/RPL mobile parts that clips one-core turbo (Intel, Linux 5.17
-//     intel_pstate: EPP <= 102 needed). The profile writes EPP 0 (ngreenpmepp=N to choose, sysctl debug.xepm.epp).
+//     intel_pstate: EPP <= 102 needed). The profile writes EPP 0 (hpmepp=N to choose, sysctl debug.hybridpm.epp).
 //  3. Energy-efficient turbo off (MSR_POWER_CTL 0x1FC bit 19).
 //  4. XCPM idle table (_xcpm_cstate_table): for the spoofed CPU it has C8 (0x40) and C10 (0x60) disabled and C3 (0x10,
 //     not an ADL/RPL/TGL state) enabled, so cores stop at C6 or fall back to C1. C8/C10 are enabled and C3 disabled,
 //     only if the three entries carry exactly those hints.
 //  5. D3hot for PCI functions macOS has no driver for (IPU camera, GNA, ISH, DPTF participant, Thunderbolt/USB4 DMA),
 //     by device id, only when nothing is attached (or only a client that never matched).
-//  6. Optional sustained power limit: ngreenpm=W (profile + PL1) or ngreenpmpl1=W writes PL1 in the MCHBAR RAPL register (0x59A0; the MSR 0x610 PL1
+//  6. Optional sustained power limit: hpm=W (profile + PL1) or hpmpl1=W writes PL1 in the MCHBAR RAPL register (0x59A0; the MSR 0x610 PL1
 //     is already higher on these machines and the lower of the two applies). Left alone without the boot-arg. On the
 //     XPS 13 Plus, 22 W gave +23 % on a 45 s all-core load at ~85 C; 25 W and 28 W reached 93-94 C and ran slower.
 //  Measured on a Dell XPS 13 Plus 9320 (i7-1360P): Geekbench 7 single-core 1269 -> 1697, multi-core 5859 -> 6148,
@@ -36,10 +44,11 @@ static inline uint64_t xpRdmsr(uint32_t m) { uint32_t lo, hi; asm volatile("rdms
 static inline void xpWrmsr(uint32_t m, uint64_t v) { asm volatile("wrmsr" : : "c"(m), "a"((uint32_t)v), "d"((uint32_t)(v >> 32))); }
 
 static bool gXpOn = false;
-static int gXpHwp = 0, gXpEpp = -1;                 // sysctl debug.xepm.hwp / .epp (root)
+static int gXpHwp = 0, gXpEpp = -1;                 // sysctl debug.hybridpm.hwp / .epp (root)
 static int gXpEet = 0, gXpCst = 0, gXpD3 = 0, gXpRoute = 0;   // status
+static bool gXpD3Want = false;   // hpmd3=1 turns the D3hot step on
 static mach_vm_address_t gXpOrgSetMult = 0, gXpCstPtr = 0;
-static bool gXpCstWant = true;   // ngreenpmcst=0 keeps XCPM's idle table (coil whine from deep C-state transitions)
+static bool gXpCstWant = true;   // hpmcst=0 keeps XCPM's idle table (coil whine from deep C-state transitions)
 
 // ─── 1/2: XCPM HWP request ───────────────────────────────────────────────────────────────────────────────────────
 static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) {   // only edi is used by Apple
@@ -150,14 +159,14 @@ static void xpPl1() {
 static void xpApply(thread_call_param_t, thread_call_param_t) {
 	xpPl1();
 	gXpCst = xpCstFix();
-	gXpD3 += xpD3();
+	if (gXpD3Want) gXpD3 += xpD3();
 	if (!gXpEet) { mp_rendezvous_no_intrs(xpEetOne, nullptr); gXpEet = (int)((xpRdmsr(0x1FC) >> 19) & 1); }
 	if (gXpOrgSetMult) gXpHwp = 1;   // takes effect at XCPM's next request on each CPU
-	IOLog("XeNG PM: profile on: HWP rescale %d (route %d), EPP %d, EE turbo off %d, C8/C10 %d, D3 %d, PL1 %d W (0x%x)\n",
+	IOLog("HybridPM: profile on: HWP rescale %d (route %d), EPP %d, EE turbo off %d, C8/C10 %d, D3 %d, PL1 %d W (0x%x)\n",
 	      gXpHwp, gXpRoute, gXpEpp, gXpEet, gXpCst, gXpD3, gXpPl1, gXpPl1Set);
 }
 
-// ─── sensors (always registered, read only): debug.xepm.sensors ──────────────────────────────────────────────────
+// ─── sensors (always registered, read only): debug.hybridpm.sensors ──────────────────────────────────────────────────
 // The stack has no working CPU temperature source (SMCProcessor finds no instances), so the menu-bar tool reads this:
 // struct { u32 version 1, ncpu, tjmax, pkg_temp_c; u8 core_temp_c[32]; u8 core_type[32] (0x40 P, 0x20 E);
 //          u32 energy_unit_bits; u32 pad; u64 pkg_energy (0x611), ia_energy (0x639), gt_energy (0x641) }.
@@ -188,12 +197,12 @@ static int xpSensors SYSCTL_HANDLER_ARGS {
 	return SYSCTL_OUT(req, &gXpSens, sizeof(gXpSens));
 }
 
-SYSCTL_NODE(_debug, OID_AUTO, xepm, CTLFLAG_RW, 0, "NootedGreen XE-PM");
-SYSCTL_PROC(_debug_xepm, OID_AUTO, sensors, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0, xpSensors, "S", "temperatures and RAPL energy");
-SYSCTL_INT(_debug_xepm, OID_AUTO, hwp, CTLFLAG_RW, &gXpHwp, 0, "HWP rescale on hybrid P-cores");
-SYSCTL_INT(_debug_xepm, OID_AUTO, epp, CTLFLAG_RW, &gXpEpp, 0, "EPP override, -1 = XCPM's");
-SYSCTL_INT(_debug_xepm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
-static int xpCstCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.xepm.cst=0|1 (live)
+SYSCTL_NODE(_debug, OID_AUTO, hybridpm, CTLFLAG_RW, 0, "HybridPM (XE-PM)");
+SYSCTL_PROC(_debug_hybridpm, OID_AUTO, sensors, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0, xpSensors, "S", "temperatures and RAPL energy");
+SYSCTL_INT(_debug_hybridpm, OID_AUTO, hwp, CTLFLAG_RW, &gXpHwp, 0, "HWP rescale on hybrid P-cores");
+SYSCTL_INT(_debug_hybridpm, OID_AUTO, epp, CTLFLAG_RW, &gXpEpp, 0, "EPP override, -1 = XCPM's");
+SYSCTL_INT(_debug_hybridpm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
+static int xpCstCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.hybridpm.cst=0|1 (live)
 	int v = gXpCst;
 	int err = SYSCTL_OUT(req, &v, sizeof(v));
 	if (err || !req->newptr) return err;
@@ -202,25 +211,27 @@ static int xpCstCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.xepm.cst=0|1
 	gXpCst = xpCstSet(gXpCstWant);
 	return gXpCst >= 2 ? EIO : 0;
 }
-SYSCTL_PROC(_debug_xepm, OID_AUTO, cst, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpCstCtl, "I", "1 = C8/C10 on (write 0/1, root)");
-SYSCTL_INT(_debug_xepm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
-SYSCTL_INT(_debug_xepm, OID_AUTO, route, CTLFLAG_RD, &gXpRoute, 0, "1 = HWP route installed");
-SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_w, CTLFLAG_RD, &gXpPl1, 0, "requested PL1 (ngreenpmpl1)");
-SYSCTL_INT(_debug_xepm, OID_AUTO, pl1_set, CTLFLAG_RD, &gXpPl1Set, 0, "MCHBAR PL1 field after the write, -1 = locked");
+SYSCTL_PROC(_debug_hybridpm, OID_AUTO, cst, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpCstCtl, "I", "1 = C8/C10 on (write 0/1, root)");
+SYSCTL_INT(_debug_hybridpm, OID_AUTO, d3, CTLFLAG_RD, &gXpD3, 0, "");
+SYSCTL_INT(_debug_hybridpm, OID_AUTO, route, CTLFLAG_RD, &gXpRoute, 0, "1 = HWP route installed");
+SYSCTL_INT(_debug_hybridpm, OID_AUTO, pl1_w, CTLFLAG_RD, &gXpPl1, 0, "requested PL1 (hpmpl1)");
+SYSCTL_INT(_debug_hybridpm, OID_AUTO, pl1_set, CTLFLAG_RD, &gXpPl1Set, 0, "MCHBAR PL1 field after the write, -1 = locked");
 
-void xePmInstall(KernelPatcher &patcher) {
-	int pmw = 0;   // ngreenpm=W: the profile plus PL1 = W watts (one boot-arg; -ngreenpm alone leaves PL1 alone)
-	const bool pmVal = PE_parse_boot_argn("ngreenpm", &pmw, sizeof(pmw));
-	sysctl_register_oid(&sysctl__debug_xepm);           // the sensors are always there (menu-bar temperature tool)
-	sysctl_register_oid(&sysctl__debug_xepm_sensors);
-	if (!checkKernelArgument("-ngreenpm") && !pmVal) return;
+void hpmInstall(KernelPatcher &patcher) {
+	int pmw = 0;   // hpm=W: the profile plus PL1 = W watts (one boot-arg; -hpm alone leaves PL1 alone)
+	const bool pmVal = PE_parse_boot_argn("hpm", &pmw, sizeof(pmw));
+	sysctl_register_oid(&sysctl__debug_hybridpm);           // the sensors are always there (menu-bar temperature tool)
+	sysctl_register_oid(&sysctl__debug_hybridpm_sensors);
+	if (!checkKernelArgument("-hpm") && !pmVal) return;
 	gXpOn = true;
 	int e = 0;
-	gXpEpp = (PE_parse_boot_argn("ngreenpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 0;
+	gXpEpp = (PE_parse_boot_argn("hpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 0;
 	int cw = 1;
-	if (PE_parse_boot_argn("ngreenpmcst", &cw, sizeof(cw))) gXpCstWant = cw != 0;
+	if (PE_parse_boot_argn("hpmcst", &cw, sizeof(cw))) gXpCstWant = cw != 0;
+	int d3 = 0;
+	if (PE_parse_boot_argn("hpmd3", &d3, sizeof(d3))) gXpD3Want = d3 != 0;
 	int w = 0;
-	if (PE_parse_boot_argn("ngreenpmpl1", &w, sizeof(w)) && w >= 5 && w <= 64) gXpPl1 = w;
+	if (PE_parse_boot_argn("hpmpl1", &w, sizeof(w)) && w >= 5 && w <= 64) gXpPl1 = w;
 	else if (pmVal && pmw >= 5 && pmw <= 64) gXpPl1 = pmw;
 	gXpCstPtr = patcher.solveSymbol(KernelPatcher::KernelID, "_xcpm_cstate_table");
 	patcher.clearError();
@@ -240,19 +251,19 @@ void xePmInstall(KernelPatcher &patcher) {
 		}
 		gXpRoute = gXpOrgSetMult ? 1 : (ok ? 5 : 3);
 	} else gXpRoute = 2;
-	sysctl_register_oid(&sysctl__debug_xepm_hwp);
-	sysctl_register_oid(&sysctl__debug_xepm_epp);
-	sysctl_register_oid(&sysctl__debug_xepm_eet_off);
-	sysctl_register_oid(&sysctl__debug_xepm_cst);
-	sysctl_register_oid(&sysctl__debug_xepm_d3);
-	sysctl_register_oid(&sysctl__debug_xepm_route);
-	sysctl_register_oid(&sysctl__debug_xepm_pl1_w);
-	sysctl_register_oid(&sysctl__debug_xepm_pl1_set);
+	sysctl_register_oid(&sysctl__debug_hybridpm_hwp);
+	sysctl_register_oid(&sysctl__debug_hybridpm_epp);
+	sysctl_register_oid(&sysctl__debug_hybridpm_eet_off);
+	sysctl_register_oid(&sysctl__debug_hybridpm_cst);
+	sysctl_register_oid(&sysctl__debug_hybridpm_d3);
+	sysctl_register_oid(&sysctl__debug_hybridpm_route);
+	sysctl_register_oid(&sysctl__debug_hybridpm_pl1_w);
+	sysctl_register_oid(&sysctl__debug_hybridpm_pl1_set);
 	uint64_t dl;
 	thread_call_t t20 = thread_call_allocate(xpApply, nullptr), t60 = thread_call_allocate(xpApply, nullptr);
 	clock_interval_to_deadline(20, kSecondScale, &dl);
 	if (t20) thread_call_enter_delayed(t20, dl);
 	clock_interval_to_deadline(60, kSecondScale, &dl);
 	if (t60) thread_call_enter_delayed(t60, dl);
-	IOLog("XeNG PM: -ngreenpm, HWP route %d, idle table %s; profile in 20 s\n", gXpRoute, gXpCstPtr ? "found" : "missing");
+	IOLog("HybridPM: -hpm, HWP route %d, idle table %s, D3 %s; profile in 20 s\n", gXpRoute, gXpCstPtr ? "found" : "missing", gXpD3Want ? "on" : "off");
 }
