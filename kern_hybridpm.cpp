@@ -35,6 +35,9 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/thread_call.h>
+#include <kern/clock.h>
+#include <mach/mach_time.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 
 extern "C" void mp_rendezvous_no_intrs(void (*fn)(void *), void *arg);
@@ -183,7 +186,12 @@ static void xpSensOne(void *) {
 	gXpSens.type[c] = (uint8_t)(r[0] >> 24);
 	__sync_fetch_and_add(&gXpSens.ncpu, 1);
 }
-static int xpSensors SYSCTL_HANDLER_ARGS {
+// The sample runs a cross-CPU rendezvous and reads the RAPL energy MSRs, so its
+// result is cached: a reader gets at most one refresh every 500 ms. That bounds
+// the cost (otherwise every read halts all CPUs) and the time resolution of the
+// RAPL energy counters, which at a high sampling rate are a power side channel.
+static uint64_t gXpSensAtNs = 0;
+static void xpSensRefresh() {
 	bzero(&gXpSens, sizeof(gXpSens));
 	gXpSens.ver = 1;
 	mp_rendezvous_no_intrs(xpSensOne, nullptr);
@@ -194,11 +202,24 @@ static int xpSensors SYSCTL_HANDLER_ARGS {
 	gXpSens.epkg = xpRdmsr(0x611) & 0xffffffffULL;
 	gXpSens.eia = xpRdmsr(0x639) & 0xffffffffULL;
 	gXpSens.egt = xpRdmsr(0x641) & 0xffffffffULL;
+}
+static int xpSensors SYSCTL_HANDLER_ARGS {
+	// Root only: an unprivileged process must not be able to read per-core
+	// temperature and RAPL energy (a power side channel), nor trigger the
+	// all-CPU rendezvous the refresh performs.
+	if (proc_suser(req->p) != 0)
+		return EPERM;
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	if (gXpSensAtNs == 0 || ns - gXpSensAtNs >= 500000000ULL) {
+		xpSensRefresh();
+		gXpSensAtNs = ns;
+	}
 	return SYSCTL_OUT(req, &gXpSens, sizeof(gXpSens));
 }
 
 SYSCTL_NODE(_debug, OID_AUTO, hybridpm, CTLFLAG_RW, 0, "HybridPM (XE-PM)");
-SYSCTL_PROC(_debug_hybridpm, OID_AUTO, sensors, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY, nullptr, 0, xpSensors, "S", "temperatures and RAPL energy");
+SYSCTL_PROC(_debug_hybridpm, OID_AUTO, sensors, CTLTYPE_OPAQUE | CTLFLAG_RD, nullptr, 0, xpSensors, "S", "temperatures and RAPL energy");
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, hwp, CTLFLAG_RW, &gXpHwp, 0, "HWP rescale on hybrid P-cores");
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, epp, CTLFLAG_RW, &gXpEpp, 0, "EPP override, -1 = XCPM's");
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
