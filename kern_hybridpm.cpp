@@ -221,7 +221,18 @@ static int xpSensors SYSCTL_HANDLER_ARGS {
 SYSCTL_NODE(_debug, OID_AUTO, hybridpm, CTLFLAG_RW, 0, "HybridPM (XE-PM)");
 SYSCTL_PROC(_debug_hybridpm, OID_AUTO, sensors, CTLTYPE_OPAQUE | CTLFLAG_RD, nullptr, 0, xpSensors, "S", "temperatures and RAPL energy");
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, hwp, CTLFLAG_RW, &gXpHwp, 0, "HWP rescale on hybrid P-cores");
-SYSCTL_INT(_debug_hybridpm, OID_AUTO, epp, CTLFLAG_RW, &gXpEpp, 0, "EPP override, -1 = XCPM's");
+static int xpEppCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.hybridpm.epp=N (live): -1 = XCPM's, else 0..255
+	int v = gXpEpp;
+	int err = SYSCTL_OUT(req, &v, sizeof(v));
+	if (err || !req->newptr) return err;
+	if ((err = SYSCTL_IN(req, &v, sizeof(v)))) return err;
+	// The value is shifted into bits 24-31 of IA32_HWP_REQUEST (0x774): anything outside -1..255 would set
+	// reserved bits and the wrmsr would #GP, i.e. panic. The hpmepp boot argument is already clamped the same way.
+	if (v < -1 || v > 255) return EINVAL;
+	gXpEpp = v;
+	return 0;
+}
+SYSCTL_PROC(_debug_hybridpm, OID_AUTO, epp, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpEppCtl, "I", "EPP override: -1 = XCPM's, else 0..255 (write root)");
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
 static int xpCstCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.hybridpm.cst=0|1 (live)
 	int v = gXpCst;
