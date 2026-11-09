@@ -15,19 +15,19 @@ repository is the unmodified file; the second is what HybridPM changes.
 
 ## What it does
 
-With `-hpm`, 20 s after Lilu's patcher starts and again at 60 s:
+20 s after Lilu's patcher starts and again at 60 s:
 
 1. HWP units on the hybrid P-cores (XCPM writes `IA32_HWP_REQUEST` in 100 MHz units; a P-core unit is about 78.7 MHz).
-2. EPP 0 instead of 0x80.
+2. EPP 96 instead of 0x80 (`hpmepp=N` for another value). On an i9-13900H, 96 held 3.6 GHz on 20 threads where EPP 0 held 3.0, at a higher idle draw.
 3. Energy-efficient turbo off (MSR `0x1FC` bit 19).
 4. XCPM C-state table: C8 and C10 on, C3 off, only when the table holds the expected values (`hpmcst=0` leaves it;
    `sysctl debug.hybridpm.cst=0|1` switches it live).
 5. D3hot for driverless PCI devices (IPU camera, GNA, ISH, DPTF, Thunderbolt DMA): **opt-in with `hpmd3=1`**.
 6. Sustained PL1 (`hpmpl1=W`, or `hpm=W`). Nothing changes without the boot-arg.
 
-Without `-hpm` the kext only registers the read-only `debug.hybridpm.sensors`.
+With `-nohpm` the kext only registers the read-only `debug.hybridpm.sensors`.
 
-Boot-args: `-hpm`, `hpm=W`, `hpmepp=N`, `hpmcst=0`, `hpmd3=1`, `hpmpl1=W`. Sysctls: `debug.hybridpm.*`.
+Boot-args: `-nohpm`, `hpm=W`, `hpmepp=N`, `hpmcst=0`, `hpmd3=1`, `hpmpl1=W`. Sysctls: `debug.hybridpm.*`.
 
 ## Non-profit declaration
 

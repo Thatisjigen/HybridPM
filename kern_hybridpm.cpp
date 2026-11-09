@@ -7,7 +7,7 @@
 //  opt-in (hpmd3=1) instead of always on; log prefix HybridPM. The logic of the six steps is unchanged.
 //
 //  XE-PM: CPU performance and idle power profile for hybrid Alder Lake / Raptor Lake (and Tiger Lake) under XCPM.
-//  Opt-in with -hpm (or hpm=W: the profile plus PL1 = W watts). Everything is applied 20 s after the patcher loads (system up), re-checked at 60 s.
+//  On by default; -nohpm leaves XCPM alone (hpm=W also sets PL1 = W watts). Everything is applied 20 s after the patcher loads (system up), re-checked at 60 s.
 //
 //  1. HWP units (hybrid P-cores). XCPM writes IA32_HWP_REQUEST (0x774) max/desired in 100 MHz ratio units (max = the
 //     TURBO_RATIO_LIMIT value, 50 on an i7-1360P). On hybrid P-cores one HWP performance unit is ~78.7 MHz (Linux
@@ -17,7 +17,7 @@
 //     cores whose highest perf exceeds the requested max (max -> highest, desired -> desired * highest / max). The
 //     route is installed only after the prologue and the write site match byte for byte.
 //  2. EPP. XCPM's frequency vector asks EPP 0x80. On ADL/RPL mobile parts that clips one-core turbo (Intel, Linux 5.17
-//     intel_pstate: EPP <= 102 needed). The profile writes EPP 0 (hpmepp=N to choose, sysctl debug.hybridpm.epp).
+//     intel_pstate: EPP <= 102 needed). The profile writes EPP 96 (hpmepp=N to choose, sysctl debug.hybridpm.epp).
 //  3. Energy-efficient turbo off (MSR_POWER_CTL 0x1FC bit 19).
 //  4. XCPM idle table (_xcpm_cstate_table): for the spoofed CPU it has C8 (0x40) and C10 (0x60) disabled and C3 (0x10,
 //     not an ADL/RPL/TGL state) enabled, so cores stop at C6 or fall back to C1. C8/C10 are enabled and C3 disabled,
@@ -250,14 +250,14 @@ SYSCTL_INT(_debug_hybridpm, OID_AUTO, pl1_w, CTLFLAG_RD, &gXpPl1, 0, "requested 
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, pl1_set, CTLFLAG_RD, &gXpPl1Set, 0, "MCHBAR PL1 field after the write, -1 = locked");
 
 void hpmInstall(KernelPatcher &patcher) {
-	int pmw = 0;   // hpm=W: the profile plus PL1 = W watts (one boot-arg; -hpm alone leaves PL1 alone)
+	int pmw = 0;   // hpm=W: PL1 = W watts as well (the profile itself is on unless -nohpm)
 	const bool pmVal = PE_parse_boot_argn("hpm", &pmw, sizeof(pmw));
 	sysctl_register_oid(&sysctl__debug_hybridpm);           // the sensors are always there (menu-bar temperature tool)
 	sysctl_register_oid(&sysctl__debug_hybridpm_sensors);
-	if (!checkKernelArgument("-hpm") && !pmVal) return;
+	if (checkKernelArgument("-nohpm")) return;
 	gXpOn = true;
 	int e = 0;
-	gXpEpp = (PE_parse_boot_argn("hpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 0;
+	gXpEpp = (PE_parse_boot_argn("hpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 96;
 	int cw = 1;
 	if (PE_parse_boot_argn("hpmcst", &cw, sizeof(cw))) gXpCstWant = cw != 0;
 	int d3 = 0;
@@ -297,5 +297,5 @@ void hpmInstall(KernelPatcher &patcher) {
 	if (t20) thread_call_enter_delayed(t20, dl);
 	clock_interval_to_deadline(60, kSecondScale, &dl);
 	if (t60) thread_call_enter_delayed(t60, dl);
-	IOLog("HybridPM: -hpm, HWP route %d, idle table %s, D3 %s; profile in 20 s\n", gXpRoute, gXpCstPtr ? "found" : "missing", gXpD3Want ? "on" : "off");
+	IOLog("HybridPM: HWP route %d, idle table %s, D3 %s, EPP %d; profile in 20 s\n", gXpRoute, gXpCstPtr ? "found" : "missing", gXpD3Want ? "on" : "off", gXpEpp);
 }
