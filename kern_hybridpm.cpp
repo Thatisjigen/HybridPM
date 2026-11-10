@@ -5,6 +5,8 @@
 //  license. Changes: taken out of NootedGreen into a standalone
 //  Lilu plugin; boot-args and sysctls renamed (-hpm, hpmepp, hpmcst, hpmd3, hpmpl1; debug.hybridpm); the D3hot step is
 //  opt-in (hpmd3=1) instead of always on; log prefix HybridPM. The logic of the six steps is unchanged.
+//  Victus fork (TrDiTu/HybridPM, branch victus): adds XE-HWPAUTO from the Victus NootedGreen patch v8 - HWP desired = 0
+//  (autonomous clock), on by default here; hpmauto=0 or sysctl debug.hybridpm.hwpauto=0 turns it off.
 //
 //  XE-PM: CPU performance and idle power profile for hybrid Alder Lake / Raptor Lake (and Tiger Lake) under XCPM.
 //  On by default; -nohpm leaves XCPM alone (hpm=W also sets PL1 = W watts). Everything is applied 20 s after the patcher loads (system up), re-checked at 60 s.
@@ -50,6 +52,12 @@ static inline void xpWrmsr(uint32_t m, uint64_t v) { asm volatile("wrmsr" : : "c
 
 static bool gXpOn = false;
 static int gXpHwp = 0, gXpEpp = -1;                 // sysctl debug.hybridpm.hwp / .epp (root)
+// XE-HWPAUTO (Victus patch v8): 1 = clear the HWP desired-performance field so the core picks its own clock (autonomous
+// HWP, like Linux intel_pstate). XCPM writes a low "desired" on a core it just moved a thread to and raises it only on
+// its next control tick; with XNU moving a single thread across 2-16 P-cores per second the clock kept dropping.
+// On the i7-12650H (NootedGreen XE-PM) GB7 went 1191/5637 -> 2030/9646. sysctl debug.hybridpm.hwpauto (live, root)
+// or boot-arg hpmauto=0|1; default 1 in this fork.
+static int gXpAuto = 1;
 static int gXpEet = 0, gXpCst = 0, gXpD3 = 0, gXpRoute = 0;   // status
 static bool gXpD3Want = false;   // hpmd3=1 turns the D3hot step on
 static mach_vm_address_t gXpOrgSetMult = 0, gXpCstPtr = 0;
@@ -85,6 +93,7 @@ static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) 
 			if (d > hi) d = hi;
 			nv = (nv & ~0xFFFF00ULL) | ((uint64_t)hi << 8) | ((uint64_t)d << 16);
 		}
+		if (gXpAuto) nv &= ~0xFF0000ULL;   // desired = 0: autonomous selection inside [min, max], guided by EPP
 		if (gXpEpp >= 0) nv = (nv & ~0xFF000000ULL) | ((uint64_t)gXpEpp << 24);
 		if (nv != v) xpWrmsr(0x774, nv);
 	}
@@ -183,8 +192,8 @@ static void xpApply(thread_call_param_t, thread_call_param_t) {
 	if (gXpD3Want) gXpD3 += xpD3();
 	if (!gXpEet) { mp_rendezvous_no_intrs(xpEetOne, nullptr); gXpEet = (int)((xpRdmsr(0x1FC) >> 19) & 1); }
 	if (gXpOrgSetMult) gXpHwp = 1;   // takes effect at XCPM's next request on each CPU
-	IOLog("HybridPM: profile on: HWP rescale %d (route %d), EPP %d, EE turbo off %d, C8/C10 %d, D3 %d, PL1 %d W (0x%x)\n",
-	      gXpHwp, gXpRoute, gXpEpp, gXpEet, gXpCst, gXpD3, gXpPl1, gXpPl1Set);
+	IOLog("HybridPM: profile on: HWP rescale %d (route %d), EPP %d, EE turbo off %d, C8/C10 %d, D3 %d, PL1 %d W (0x%x), HWPAUTO %d\n",
+	      gXpHwp, gXpRoute, gXpEpp, gXpEet, gXpCst, gXpD3, gXpPl1, gXpPl1Set, gXpAuto);
 }
 
 // ─── sensors (always registered, read only): debug.hybridpm.sensors ──────────────────────────────────────────────────
@@ -251,6 +260,7 @@ static int xpEppCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.hybridpm.epp
 	return 0;
 }
 SYSCTL_PROC(_debug_hybridpm, OID_AUTO, epp, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpEppCtl, "I", "EPP override: -1 = XCPM's, else 0..255 (write root)");
+SYSCTL_INT(_debug_hybridpm, OID_AUTO, hwpauto, CTLFLAG_RW, &gXpAuto, 0, "1 = HWP desired 0 (autonomous clock)");
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
 static int xpCstCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.hybridpm.cst=0|1 (live)
 	int v = gXpCst;
@@ -276,6 +286,8 @@ void hpmInstall(KernelPatcher &patcher) {
 	gXpOn = true;
 	int e = 0;
 	gXpEpp = (PE_parse_boot_argn("hpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 64;
+	int au = 1;
+	if (PE_parse_boot_argn("hpmauto", &au, sizeof(au))) gXpAuto = au != 0;
 	int cw = 1;
 	if (PE_parse_boot_argn("hpmcst", &cw, sizeof(cw))) gXpCstWant = cw != 0;
 	int d3 = 0;
@@ -303,6 +315,7 @@ void hpmInstall(KernelPatcher &patcher) {
 	} else gXpRoute = 2;
 	sysctl_register_oid(&sysctl__debug_hybridpm_hwp);
 	sysctl_register_oid(&sysctl__debug_hybridpm_epp);
+	sysctl_register_oid(&sysctl__debug_hybridpm_hwpauto);
 	sysctl_register_oid(&sysctl__debug_hybridpm_eet_off);
 	sysctl_register_oid(&sysctl__debug_hybridpm_cst);
 	sysctl_register_oid(&sysctl__debug_hybridpm_d3);
