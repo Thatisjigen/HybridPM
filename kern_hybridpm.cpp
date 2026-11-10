@@ -59,7 +59,23 @@ static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) 
 	// XCPM calls this before it enables HWP; the HWP MSRs #GP until IA32_PM_ENABLE bit 0 is set.
 	if (gXpHwp && (xpRdmsr(0x770) & 1)) {
 		const uint64_t v = xpRdmsr(0x774);
-		if (v & (1ULL << 42)) return r;   // package control: leave it alone
+		if (v & (1ULL << 42)) {
+			// Package control: this core follows IA32_HWP_REQUEST_PKG (0x772), which XCPM
+			// fills in the same 100 MHz units. Rescale that request on a core whose highest
+			// performance exceeds the package max (a P-core); E-cores clip to their own limit.
+			const uint32_t hi = (uint32_t)(xpRdmsr(0x771) & 0xff);
+			const uint64_t pv = xpRdmsr(0x772);
+			const uint32_t pmax = (uint32_t)(pv >> 8) & 0xff, pdes = (uint32_t)(pv >> 16) & 0xff;
+			uint64_t np = pv;
+			if (pmax && hi > pmax && hi < 0xff) {
+				uint32_t d = pdes ? (pdes * hi + pmax / 2) / pmax : 0;
+				if (d > hi) d = hi;
+				np = (np & ~0xFFFF00ULL) | ((uint64_t)hi << 8) | ((uint64_t)d << 16);
+			}
+			if (gXpEpp >= 0) np = (np & ~0xFF000000ULL) | ((uint64_t)gXpEpp << 24);
+			if (np != pv) xpWrmsr(0x772, np);
+			return r;
+		}
 		const uint32_t hi = (uint32_t)(xpRdmsr(0x771) & 0xff), max = (uint32_t)(v >> 8) & 0xff, des = (uint32_t)(v >> 16) & 0xff;
 		uint64_t nv = v;
 		if (max && hi > max && hi < 0xff) {
