@@ -18,7 +18,9 @@ repository is the unmodified file; the second is what HybridPM changes.
 20 s after Lilu's patcher starts and again at 60 s:
 
 1. HWP units on the hybrid P-cores (XCPM writes `IA32_HWP_REQUEST` in 100 MHz units; a P-core unit is about 78.7 MHz).
-2. EPP 96 instead of 0x80 (`hpmepp=N` for another value). On an i9-13900H, 96 held 3.6 GHz on 20 threads where EPP 0 held 3.0, at a higher idle draw.
+2. EPP 64 instead of 0x80 (`hpmepp=N` for another value). With HWP choosing the clock, 96 rose too slowly for the short, periodic work of
+   composing 144 Hz displays, which dropped frames; 64 is the highest value that kept them smooth, with the lowest idle draw of 0 to 96.
+   Under an all-core load lower values lose clock: on an i9-13900H, 96 held 3.6 GHz on 20 threads where EPP 0 held 3.0.
 3. Energy-efficient turbo off (MSR `0x1FC` bit 19).
 4. XCPM C-state table: C8 and C10 on, C3 off, only when the table holds the expected values (`hpmcst=0` leaves it;
    `sysctl debug.hybridpm.cst=0|1` switches it live).

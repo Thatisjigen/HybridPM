@@ -19,7 +19,9 @@
 //     cores whose highest perf exceeds the requested max (max -> highest, desired -> desired * highest / max). The
 //     route is installed only after the prologue and the write site match byte for byte.
 //  2. EPP. XCPM's frequency vector asks EPP 0x80. On ADL/RPL mobile parts that clips one-core turbo (Intel, Linux 5.17
-//     intel_pstate: EPP <= 102 needed). The profile writes EPP 96 (hpmepp=N to choose, sysctl debug.hybridpm.epp).
+//     intel_pstate: EPP <= 102 needed). The profile writes EPP 64 (hpmepp=N to choose, sysctl debug.hybridpm.epp): with
+//     HWP choosing the clock, at 96 a core rose too slowly for the short, periodic work of composing a 144 Hz display and
+//     frames were dropped; 64 is the highest value that kept the displays smooth, with the lowest idle draw of 0 to 96.
 //  3. Energy-efficient turbo off (MSR_POWER_CTL 0x1FC bit 19).
 //  4. XCPM idle table (_xcpm_cstate_table): for the spoofed CPU it has C8 (0x40) and C10 (0x60) disabled and C3 (0x10,
 //     not an ADL/RPL/TGL state) enabled, so cores stop at C6 or fall back to C1. C8/C10 are enabled and C3 disabled,
@@ -283,7 +285,7 @@ void hpmInstall(KernelPatcher &patcher) {
 	if (checkKernelArgument("-nohpm")) return;
 	gXpOn = true;
 	int e = 0;
-	gXpEpp = (PE_parse_boot_argn("hpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 96;
+	gXpEpp = (PE_parse_boot_argn("hpmepp", &e, sizeof(e)) && e >= 0 && e <= 255) ? e : 64;
 	int au = 1;
 	if (PE_parse_boot_argn("hpmauto", &au, sizeof(au))) gXpAuto = au != 0;
 	int cw = 1;
