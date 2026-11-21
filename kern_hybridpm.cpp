@@ -7,6 +7,8 @@
 //  opt-in (hpmd3=1) instead of always on; log prefix HybridPM. The logic of the six steps is unchanged.
 //  Victus fork (TrDiTu/HybridPM, branch victus): adds XE-HWPAUTO from the Victus NootedGreen patch v8 - HWP desired = 0
 //  (autonomous clock), on by default here; hpmauto=0 or sysctl debug.hybridpm.hwpauto=0 turns it off.
+//  Step 1 on hybrid cores: P-cores convert a lower max from XCPM (Low Power Mode) instead of raising it to the highest,
+//  and E-cores keep XCPM's request.
 //
 //  XE-PM: CPU performance and idle power profile for hybrid Alder Lake / Raptor Lake (and Tiger Lake) under XCPM.
 //  On by default; -nohpm leaves XCPM alone (hpm=W also sets PL1 = W watts). Everything is applied 20 s after the patcher loads (system up), re-checked at 60 s.
@@ -15,9 +17,13 @@
 //     TURBO_RATIO_LIMIT value, 50 on an i7-1360P). On hybrid P-cores one HWP performance unit is ~78.7 MHz (Linux
 //     intel_pstate hybrid scaling factor 78741; HWP_CAPABILITIES highest = 64 for 5.0 GHz), so max 50 caps them at
 //     ~3.9 GHz. The static XCPM routine at _xcpm_enable_pstate_ctrs+0x1190 (macOS 26.7.1 25G241) takes the target
-//     multiplier and writes the local CPU's request; it is routed, and after Apple's write the request is rescaled on
-//     cores whose highest perf exceeds the requested max (max -> highest, desired -> desired * highest / max). The
-//     route is installed only after the prologue and the write site match byte for byte.
+//     multiplier and writes the local CPU's request; it is routed, and after Apple's write the request is rescaled.
+//     On a hybrid P-core (CPUID 0x1A core type 0x40) max and desired both scale by highest / turbo, where turbo is
+//     the 1-core ratio of TURBO_RATIO_LIMIT (0x1AD bits 7:0), the 100 MHz ratio that reaches the highest perf. XCPM's
+//     full max becomes the highest; a lower max it asks for (Low Power Mode, thermal) stays proportionally lower.
+//     E-cores already count 100 MHz units and keep XCPM's request. Non-hybrid cores whose highest perf exceeds the
+//     requested max keep the original rule (max -> highest, desired -> desired * highest / max). The route is
+//     installed only after the prologue and the write site match byte for byte.
 //  2. EPP. XCPM's frequency vector asks EPP 0x80. On ADL/RPL mobile parts that clips one-core turbo (Intel, Linux 5.17
 //     intel_pstate: EPP <= 102 needed). The profile writes EPP 64 (hpmepp=N to choose, sysctl debug.hybridpm.epp): with
 //     HWP choosing the clock, at 96 a core rose too slowly for the short, periodic work of composing a 144 Hz display and
@@ -64,6 +70,32 @@ static mach_vm_address_t gXpOrgSetMult = 0, gXpCstPtr = 0;
 static bool gXpCstWant = true;   // hpmcst=0 keeps XCPM's idle table (coil whine from deep C-state transitions)
 
 // ─── 1/2: XCPM HWP request ───────────────────────────────────────────────────────────────────────────────────────
+// Core type of the CPU this runs on: CPUID 0x1A EAX[31:24], 0x40 P-core, 0x20 E-core; 0 without hybrid (CPUID 7 EDX[15]).
+static inline uint32_t xpCoreType() {
+	uint32_t a, b, c, d;
+	asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
+	if (!(d & (1U << 15))) return 0;
+	asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x1A), "c"(0));
+	return a >> 24;
+}
+
+// Max and desired of an HWP request (0x774 or 0x772) as XCPM wrote them, in 100 MHz ratios, converted to this core's
+// HWP units (see step 1). Without a usable turbo ratio a P-core falls back to the original rule.
+static uint64_t xpRescale(uint64_t v, uint32_t hi) {
+	const uint32_t max = (uint32_t)(v >> 8) & 0xff, des = (uint32_t)(v >> 16) & 0xff, type = xpCoreType();
+	if (!max || hi >= 0xff || type == 0x20) return v;
+	uint32_t ref = hi > max ? max : 0;
+	if (type == 0x40) {
+		const uint32_t turbo = (uint32_t)(xpRdmsr(0x1AD) & 0xff);
+		if (turbo && turbo < hi) ref = turbo;
+	}
+	if (!ref) return v;
+	uint32_t m = (max * hi + ref / 2) / ref, d = des ? (des * hi + ref / 2) / ref : 0;
+	if (m > hi) m = hi;
+	if (d > m) d = m;
+	return (v & ~0xFFFF00ULL) | ((uint64_t)m << 8) | ((uint64_t)d << 16);
+}
+
 static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) {   // only edi is used by Apple
 	const uint64_t r = FunctionCast(xpSetMult, gXpOrgSetMult)(mult, a1, a2, a3);
 	// XCPM calls this before it enables HWP; the HWP MSRs #GP until IA32_PM_ENABLE bit 0 is set.
@@ -71,28 +103,15 @@ static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) 
 		const uint64_t v = xpRdmsr(0x774);
 		if (v & (1ULL << 42)) {
 			// Package control: this core follows IA32_HWP_REQUEST_PKG (0x772), which XCPM
-			// fills in the same 100 MHz units. Rescale that request on a core whose highest
-			// performance exceeds the package max (a P-core); E-cores clip to their own limit.
-			const uint32_t hi = (uint32_t)(xpRdmsr(0x771) & 0xff);
+			// fills in the same 100 MHz units. Rescale that request on a P-core;
+			// E-cores leave it and clip to their own limit.
 			const uint64_t pv = xpRdmsr(0x772);
-			const uint32_t pmax = (uint32_t)(pv >> 8) & 0xff, pdes = (uint32_t)(pv >> 16) & 0xff;
-			uint64_t np = pv;
-			if (pmax && hi > pmax && hi < 0xff) {
-				uint32_t d = pdes ? (pdes * hi + pmax / 2) / pmax : 0;
-				if (d > hi) d = hi;
-				np = (np & ~0xFFFF00ULL) | ((uint64_t)hi << 8) | ((uint64_t)d << 16);
-			}
+			uint64_t np = xpRescale(pv, (uint32_t)(xpRdmsr(0x771) & 0xff));
 			if (gXpEpp >= 0) np = (np & ~0xFF000000ULL) | ((uint64_t)gXpEpp << 24);
 			if (np != pv) xpWrmsr(0x772, np);
 			return r;
 		}
-		const uint32_t hi = (uint32_t)(xpRdmsr(0x771) & 0xff), max = (uint32_t)(v >> 8) & 0xff, des = (uint32_t)(v >> 16) & 0xff;
-		uint64_t nv = v;
-		if (max && hi > max && hi < 0xff) {
-			uint32_t d = des ? (des * hi + max / 2) / max : 0;
-			if (d > hi) d = hi;
-			nv = (nv & ~0xFFFF00ULL) | ((uint64_t)hi << 8) | ((uint64_t)d << 16);
-		}
+		uint64_t nv = xpRescale(v, (uint32_t)(xpRdmsr(0x771) & 0xff));
 		if (gXpAuto) nv &= ~0xFF0000ULL;   // desired = 0: autonomous selection inside [min, max], guided by EPP
 		if (gXpEpp >= 0) nv = (nv & ~0xFF000000ULL) | ((uint64_t)gXpEpp << 24);
 		if (nv != v) xpWrmsr(0x774, nv);
