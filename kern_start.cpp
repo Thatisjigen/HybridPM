@@ -1,10 +1,13 @@
 //  HybridPM: Lilu plugin entry. XE-PM's install, taken out of NootedGreen, runs when Lilu's kernel patcher
-//  is ready; without -hpm (or hpm=W) it registers only the read-only debug.hybridpm.sensors sysctl.
-//  kern_hybridpm.cpp is under the Thou Shalt Not Profit License 1.0, and so is this file, which only starts it.
+//  is ready; with -nohpm it registers only the read-only debug.hybridpm.sensors sysctl. The USB idle policies
+//  (kern_usbidle.cpp) wait for IOUSBHostFamily and have their own switch, -hpmusboff.
+//  kern_hybridpm.cpp and kern_usbidle.cpp are under the Thou Shalt Not Profit License 1.0, and so is this file, which
+//  only starts them.
 #include <Headers/plugin_start.hpp>
 #include <Headers/kern_api.hpp>
 
 void hpmInstall(KernelPatcher &patcher);
+void usbIdleInstall();
 
 static const char *bootargOff[] {"-hpmoff"};
 static const char *bootargDebug[] {"-hpmdbg"};
@@ -24,5 +27,6 @@ PluginConfiguration ADDPR(config) {
 	KernelVersion::Tahoe,
 	[]() {
 		lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { hpmInstall(patcher); });
+		usbIdleInstall();
 	}
 };

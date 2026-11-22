@@ -30,7 +30,27 @@ repository is the unmodified file; the second is what HybridPM changes.
 
 With `-nohpm` the kext only registers the read-only `debug.hybridpm.sensors`.
 
-Boot-args: `-nohpm`, `hpm=W`, `hpmepp=N`, `hpmcst=0`, `hpmd3=1`, `hpmpl1=W`. Sysctls: `debug.hybridpm.*`.
+## USB idle suspend
+
+Internal USB devices whose drivers never set an IOUSBHost idle policy stay powered, and the xHCI keeps polling them,
+which holds the package in shallow C-states: the Bluetooth controller (bluetoothd sets none, a Mac's Bluetooth is on
+UART or PCIe) and the camera (neither does the UVC driver). `kern_usbidle.cpp` routes `IOUSBHostInterface::copyPipe`
+and sets the policy:
+
+- on the Bluetooth interfaces (class E0/01/01) whose pipes bluetoothd takes, and on the IN pipes of interface 0. The
+  controller suspends after 2 s idle and wakes itself with remote wakeup. Its firmware loader (SimpleMtkBtFw,
+  IntelBluetoothFirmware) is then taken out of the device's power tree, where it would keep idle suspend off;
+- on the video interfaces of a camera on an internal port, and on the interrupt IN pipe of its control interface (not the
+  isochronous one), also from a scan 10 s after a USB device appears.
+
+`hpmbtidle=ms` and `hpmcamidle=ms` choose the idle time (default 2000, 0 = off), `-hpmusboff` leaves USB alone. Sysctls
+`debug.hybridpm.btidle` (with the next Bluetooth transfer) and `debug.hybridpm.camidle` (at once). Counters: the
+`HybridPMUsbIdle` property of the IORegistry root. Based on `G15PM` (`kern_btidle.cpp`) by Rodrigo Rangel,
+[rodgod-rr/Dell-G15-5530-Hackintosh@df44c68](https://github.com/rodgod-rr/Dell-G15-5530-Hackintosh/commit/df44c68),
+under the same license.
+
+Boot-args: `-nohpm`, `hpm=W`, `hpmepp=N`, `hpmcst=0`, `hpmd3=1`, `hpmpl1=W`, `-hpmusboff`, `hpmbtidle=ms`,
+`hpmcamidle=ms`. Sysctls: `debug.hybridpm.*`.
 
 ## Non-profit declaration
 

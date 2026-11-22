@@ -24,7 +24,7 @@ FLAGS=(-arch x86_64 -mmacosx-version-min=10.6 -std=c++14 -mkernel -fapple-kext -
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -DMODULE_VERSION=$VER -DPRODUCT_NAME=HybridPM
   -O3 -flto -fvisibility=hidden -fno-rtti -fno-exceptions -fno-builtin -fno-common -Wall -Wno-unused-parameter)
 : > "$B/compile.log"
-for f in "$SDK/Library/plugin_start.cpp" "$S/kern_start.cpp" "$S/kern_hybridpm.cpp"; do
+for f in "$SDK/Library/plugin_start.cpp" "$S/kern_start.cpp" "$S/kern_hybridpm.cpp" "$S/kern_usbidle.cpp"; do
   xcrun clang++ "${FLAGS[@]}" -c "$f" -o "$B/$(basename "${f%.cpp}").o" 2>> "$B/compile.log" || { tail -30 "$B/compile.log"; exit 1; }
 done
 cat > "$B/HybridPM_info.c" <<EOC
@@ -42,7 +42,7 @@ xcrun clang -arch x86_64 -mmacosx-version-min=10.6 -mkernel -nostdinc -I"$K" -DK
   -c "$B/HybridPM_info.c" -o "$B/HybridPM_info.o"
 BIN="$O/HybridPM.kext/Contents/MacOS/HybridPM"
 xcrun clang++ -arch x86_64 -mmacosx-version-min=10.6 -mkernel -fapple-kext -nostdlib -flto -Xlinker -kext -Xlinker -dead_strip -static \
-  -L"$W/sdk/MacKernelSDK/Library/universal" "$B"/{plugin_start,kern_start,kern_hybridpm,HybridPM_info}.o -lkmodc++ -lkmod -lcc_kext -o "$BIN"
+  -L"$W/sdk/MacKernelSDK/Library/universal" "$B"/{plugin_start,kern_start,kern_hybridpm,kern_usbidle,HybridPM_info}.o -lkmodc++ -lkmod -lcc_kext -o "$BIN"
 strip -S "$BIN"; strip -x -T "$BIN" 2>/dev/null || strip -x "$BIN"
 cp "$S/Info.plist" "$O/HybridPM.kext/Contents/Info.plist"
 mkdir -p "$O/HybridPM.kext/Contents/Resources" && cp "$S/LICENSE-TSNPL-1.0.txt" "$O/HybridPM.kext/Contents/Resources/"
