@@ -81,19 +81,34 @@ static inline uint32_t xpCoreType() {
 
 // Max and desired of an HWP request (0x774 or 0x772) as XCPM wrote them, in 100 MHz ratios, converted to this core's
 // HWP units (see step 1). Without a usable turbo ratio a P-core falls back to the original rule.
-static uint64_t xpRescale(uint64_t v, uint32_t hi) {
-	const uint32_t max = (uint32_t)(v >> 8) & 0xff, des = (uint32_t)(v >> 16) & 0xff, type = xpCoreType();
+static uint64_t xpRescaleAs(uint64_t v, uint32_t hi, uint32_t type, uint32_t turbo) {
+	const uint32_t max = (uint32_t)(v >> 8) & 0xff, des = (uint32_t)(v >> 16) & 0xff;
 	if (!max || hi >= 0xff || type == 0x20) return v;
 	uint32_t ref = hi > max ? max : 0;
-	if (type == 0x40) {
-		const uint32_t turbo = (uint32_t)(xpRdmsr(0x1AD) & 0xff);
-		if (turbo && turbo < hi) ref = turbo;
-	}
+	if (type == 0x40 && turbo && turbo < hi) ref = turbo;
 	if (!ref) return v;
 	uint32_t m = (max * hi + ref / 2) / ref, d = des ? (des * hi + ref / 2) / ref : 0;
 	if (m > hi) m = hi;
 	if (d > m) d = m;
 	return (v & ~0xFFFF00ULL) | ((uint64_t)m << 8) | ((uint64_t)d << 16);
+}
+
+// P-core reference for the package request: highest perf (0x771) and 1-core turbo ratio (0x1AD), recorded the first
+// time this runs on a P-core. Under package control every core follows 0x772, so its max must be converted to P-core
+// units whichever core XCPM happens to write it from; an E-core alone would leave the P-cores capped (~3.9 GHz).
+static volatile uint32_t gXpPHi = 0, gXpPTurbo = 0;
+
+static uint64_t xpRescale(uint64_t v, uint32_t hi) {
+	const uint32_t type = xpCoreType();
+	const uint32_t turbo = type == 0x40 ? (uint32_t)(xpRdmsr(0x1AD) & 0xff) : 0;
+	if (type == 0x40 && !gXpPHi && hi && hi < 0xff) { gXpPTurbo = turbo; gXpPHi = hi; }
+	return xpRescaleAs(v, hi, type, turbo);
+}
+
+static uint64_t xpRescalePkg(uint64_t v, uint32_t hi) {
+	const uint32_t phi = gXpPHi, pturbo = gXpPTurbo;
+	if (xpCoreType() == 0x20 && phi) return xpRescaleAs(v, phi, 0x40, pturbo);
+	return xpRescale(v, hi);
 }
 
 static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) {   // only edi is used by Apple
@@ -103,10 +118,12 @@ static uint64_t xpSetMult(uint64_t mult, uint64_t a1, uint64_t a2, uint64_t a3) 
 		const uint64_t v = xpRdmsr(0x774);
 		if (v & (1ULL << 42)) {
 			// Package control: this core follows IA32_HWP_REQUEST_PKG (0x772), which XCPM
-			// fills in the same 100 MHz units. Rescale that request on a P-core;
-			// E-cores leave it and clip to their own limit.
+			// fills in the same 100 MHz units. Rescale it to P-core units (also when XCPM
+			// writes it from an E-core, using the recorded P-core reference); E-cores clip
+			// to their own limit. HWPAUTO applies here too: desired 0 lets each core pick.
 			const uint64_t pv = xpRdmsr(0x772);
-			uint64_t np = xpRescale(pv, (uint32_t)(xpRdmsr(0x771) & 0xff));
+			uint64_t np = xpRescalePkg(pv, (uint32_t)(xpRdmsr(0x771) & 0xff));
+			if (gXpAuto) np &= ~0xFF0000ULL;
 			if (gXpEpp >= 0) np = (np & ~0xFF000000ULL) | ((uint64_t)gXpEpp << 24);
 			if (np != pv) xpWrmsr(0x772, np);
 			return r;
@@ -280,6 +297,8 @@ static int xpEppCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.hybridpm.epp
 }
 SYSCTL_PROC(_debug_hybridpm, OID_AUTO, epp, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, xpEppCtl, "I", "EPP override: -1 = XCPM's, else 0..255 (write root)");
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, hwpauto, CTLFLAG_RW, &gXpAuto, 0, "1 = HWP desired 0 (autonomous clock)");
+SYSCTL_UINT(_debug_hybridpm, OID_AUTO, pcore_hi, CTLFLAG_RD, (unsigned int *)&gXpPHi, 0, "P-core HWP highest used for the package request (0 = not yet seen)");
+SYSCTL_UINT(_debug_hybridpm, OID_AUTO, pcore_turbo, CTLFLAG_RD, (unsigned int *)&gXpPTurbo, 0, "P-core 1-core turbo ratio used for the package request");
 SYSCTL_INT(_debug_hybridpm, OID_AUTO, eet_off, CTLFLAG_RD, &gXpEet, 0, "");
 static int xpCstCtl SYSCTL_HANDLER_ARGS {   // sudo sysctl -w debug.hybridpm.cst=0|1 (live)
 	int v = gXpCst;
@@ -335,6 +354,8 @@ void hpmInstall(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_hybridpm_hwp);
 	sysctl_register_oid(&sysctl__debug_hybridpm_epp);
 	sysctl_register_oid(&sysctl__debug_hybridpm_hwpauto);
+	sysctl_register_oid(&sysctl__debug_hybridpm_pcore_hi);
+	sysctl_register_oid(&sysctl__debug_hybridpm_pcore_turbo);
 	sysctl_register_oid(&sysctl__debug_hybridpm_eet_off);
 	sysctl_register_oid(&sysctl__debug_hybridpm_cst);
 	sysctl_register_oid(&sysctl__debug_hybridpm_d3);
